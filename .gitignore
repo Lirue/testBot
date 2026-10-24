@@ -1,0 +1,5 @@
+node_modules/
+.stock-state.json
+books.json
+*.html
+

@@ -1,0 +1,57 @@
+name: Book Stock Bot
+
+on:
+  # Uruchamianie automatyczne co 30 minut
+  schedule:
+    - cron: '*/30 * * * *'
+
+  # Możliwość ręcznego uruchomienia z zakładki "Actions" na GitHubie
+  workflow_dispatch:
+    inputs:
+      send_test_notification:
+        description: 'Wyślij testowe powiadomienie na Discord (nawet jeśli produkt jest niedostępny)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+jobs:
+  check-stock:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Pobierz kod repozytorium
+        uses: actions/checkout@v4
+
+      - name: Skonfiguruj Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Przywróć ostatni zapisany stan dostępności (Cache)
+        uses: actions/cache@v4
+        with:
+          path: .stock-state.json
+          key: stock-state-${{ github.run_id }}
+          restore-keys: |
+            stock-state-
+
+      - name: Zainstaluj zależności
+        run: npm install
+
+      - name: Zainstaluj przeglądarkę Playwright Chromium (jako zapas)
+        run: npx playwright install chromium
+
+      - name: Sprawdź dostępność produktów
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          BOOK_URLS: ${{ secrets.BOOK_URLS }}
+          SEND_TEST_NOTIFICATION: ${{ inputs.send_test_notification || 'false' }}
+          # Ustaw na 'false', jeśli chcesz dostać powiadomienie tylko raz w momencie zmiany ze stanu niedostępnego na dostępny
+          ALWAYS_NOTIFY: 'true'
+          PLAYWRIGHT_HEADLESS: 'false'
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1366x768x24" node check-stock.js
+
