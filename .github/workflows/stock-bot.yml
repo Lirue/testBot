@@ -20,7 +20,7 @@ on:
 jobs:
   check-stock:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
 
     steps:
       - name: Pobierz kod repozytorium
@@ -42,8 +42,8 @@ jobs:
       - name: Zainstaluj zależności
         run: npm install
 
-      - name: Zainstaluj przeglądarkę Playwright Chromium (jako zapas)
-        run: npx playwright install chromium
+      - name: Zainstaluj przeglądarkę Patchright Chromium (jako zapas)
+        run: npx patchright install chromium
 
       - name: Sprawdź dostępność produktów
         env:

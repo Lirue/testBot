@@ -1,5 +1,6 @@
 node_modules/
 .stock-state.json
+.browser-profile/
 books.json
 *.html
 

@@ -21,6 +21,8 @@ function parseProductHtml(html, fallbackUrl = '') {
       blockedByCloudflare: true,
       available: false,
       statusType: 'CLOUDFLARE_BLOCKED',
+      buyButtonText: 'Zablokowano (Cloudflare)',
+      schemaAvailability: 'Brak',
       reason: 'Strona zwróciła ekran weryfikacji Cloudflare (Just a moment...)'
     };
   }
@@ -165,99 +167,214 @@ function getBookUrls() {
     .filter((u) => u.startsWith('http://') || u.startsWith('https://'));
 }
 
+let sharedBrowserContext = null;
+let sharedBrowserInstance = null;
+let forceBrowserMode = false;
+
 /**
- * Pobiera kod HTML strony produktu.
- * Najpierw próbuje szybkiego zapytania fetch, a jeśli Cloudflare zablokuje ruch,
- * automatycznie uruchamia przeglądarkę Playwright (Chrome/Chromium).
+ * Tworzy (lub zwraca istniejący) kontekst przeglądarki odporny na detekcję Cloudflare Turnstile.
+ * Używa "patchright" (jeśli dostępny) bez sztucznego nadpisywania User-Agent (aby uniknąć konfliktu Windows UA vs Linux navigator.platform).
  */
-async function fetchProductHtml(url) {
-  const headers = {
-    'User-Agent':
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-    Accept:
-      'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-    'Accept-Language': 'en-GB,en;q=0.9,pl-PL;q=0.8,pl;q=0.7',
-    'Cache-Control': 'no-cache',
-    Pragma: 'no-cache',
-    'Sec-Ch-Ua': '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-    'Sec-Ch-Ua-Mobile': '?0',
-    'Sec-Ch-Ua-Platform': '"Windows"',
-    'Sec-Fetch-Dest': 'document',
-    'Sec-Fetch-Mode': 'navigate',
-    'Sec-Fetch-Site': 'none',
-    'Sec-Fetch-User': '?1',
-    'Upgrade-Insecure-Requests': '1'
-  };
-
-  try {
-    const response = await fetch(url, { headers, redirect: 'follow' });
-    const html = await response.text();
-    const check = parseProductHtml(html, url);
-
-    if (response.ok && !check.blockedByCloudflare && check.statusType !== 'UNKNOWN_PAGE_STRUCTURE') {
-      return html;
-    }
-    console.log(
-      `[INFO] Zwykłe zapytanie HTTP zwróciło status ${response.status} (${check.statusType}). Próbuję przez przeglądarkę...`
-    );
-  } catch (err) {
-    console.log(`[INFO] Błąd zwykłego zapytania HTTP. Próbuję przez przeglądarkę...`);
+async function getBrowserContext() {
+  if (sharedBrowserContext) {
+    return sharedBrowserContext;
   }
 
-  let playwright;
+  let pw;
   try {
-    playwright = require('playwright');
+    pw = require('patchright');
   } catch (_) {
-    throw new Error(
-      'Zwykłe zapytanie zostało zablokowane, a pakiet "playwright" nie jest zainstalowany. Uruchom: npm install'
-    );
+    try {
+      pw = require('playwright');
+    } catch (__) {
+      throw new Error(
+        'Zwykłe zapytanie zostało zablokowane, a pakiet "patchright" / "playwright" nie jest zainstalowany. Uruchom: npm install'
+      );
+    }
   }
 
   const useHeaded = process.env.PLAYWRIGHT_HEADLESS === 'false';
-  const launchOptions = {
+  const userDataDir = path.join(__dirname, '.browser-profile');
+
+  const launchArgs = [
+    '--disable-blink-features=AutomationControlled',
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-dev-shm-usage',
+    '--window-size=1366,768'
+  ];
+
+  const contextOptions = {
     headless: !useHeaded,
-    args: [
-      '--disable-blink-features=AutomationControlled',
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage'
-    ]
+    args: launchArgs,
+    locale: 'en-GB',
+    timezoneId: 'Europe/London',
+    viewport: { width: 1366, height: 768 }
   };
 
-  let browser;
   try {
-    browser = await playwright.chromium.launch({ ...launchOptions, channel: 'chrome' });
+    sharedBrowserContext = await pw.chromium.launchPersistentContext(userDataDir, {
+      ...contextOptions,
+      channel: 'chrome'
+    });
   } catch (_) {
-    browser = await playwright.chromium.launch(launchOptions);
+    try {
+      sharedBrowserContext = await pw.chromium.launchPersistentContext(userDataDir, contextOptions);
+    } catch (__) {
+      sharedBrowserInstance = await pw.chromium.launch({
+        headless: !useHeaded,
+        args: launchArgs
+      });
+      sharedBrowserContext = await sharedBrowserInstance.newContext({
+        locale: 'en-GB',
+        timezoneId: 'Europe/London',
+        viewport: { width: 1366, height: 768 }
+      });
+    }
   }
 
+  return sharedBrowserContext;
+}
+
+async function closeBrowserContext() {
   try {
-    const context = await browser.newContext({
-      userAgent: headers['User-Agent'],
-      locale: 'en-GB',
-      timezoneId: 'Europe/London',
-      viewport: { width: 1366, height: 768 }
-    });
+    if (sharedBrowserContext) {
+      await sharedBrowserContext.close();
+      sharedBrowserContext = null;
+    }
+    if (sharedBrowserInstance) {
+      await sharedBrowserInstance.close();
+      sharedBrowserInstance = null;
+    }
+  } catch (_) {}
+}
 
-    await context.addInitScript(() => {
-      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    });
+/**
+ * Próbuje rozwiązać (kliknąć) widget Cloudflare Turnstile ("Verify you are human"),
+ * jeśli strona wyświetla ekran "Just a moment...".
+ */
+async function waitAndSolveCloudflare(page, maxWaitMs = 35000) {
+  const start = Date.now();
 
-    const page = await context.newPage();
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+  while (Date.now() - start < maxWaitMs) {
+    // Sprawdź, czy docelowa zawartość strony jest już widoczna
+    const hasProductContent = await page
+      .locator('#scope_book_title, .book-actions')
+      .first()
+      .isVisible()
+      .catch(() => false);
 
-    try {
-      await page.waitForSelector('#scope_book_title, .book-actions', {
-        timeout: 20000
-      });
-    } catch (_) {
-      // Jeśli po 20s nadal nie widać tytułu/przycisków, pobierz aktualny HTML do analizy
+    if (hasProductContent) {
+      return true;
     }
 
-    return await page.content();
-  } finally {
-    await browser.close();
+    const title = await page.title().catch(() => '');
+    const content = await page.content().catch(() => '');
+    const isCf =
+      title.includes('Just a moment') ||
+      content.includes('cf-browser-verification') ||
+      content.includes('challenge-platform');
+
+    if (!isCf && content.includes('scope_book_title')) {
+      return true;
+    }
+
+    // Szukamy współrzędnych widgetu Cloudflare Turnstile, aby kliknąć pole wyboru
+    try {
+      const clickTarget = await page.evaluate(() => {
+        // 1. Sprawdź widoczne iframe Cloudflare
+        const iframes = Array.from(document.querySelectorAll('iframe'));
+        for (const iframe of iframes) {
+          const rect = iframe.getBoundingClientRect();
+          if (rect.width >= 200 && rect.height >= 40) {
+            return { x: rect.left + 30, y: rect.top + rect.height / 2 };
+          }
+        }
+
+        // 2. Sprawdź kontenery Turnstile na stronie "Just a moment..." (nawet z zamkniętym Shadow DOM)
+        const candidates = Array.from(
+          document.querySelectorAll(
+            '#turnstile-wrapper, .cf-turnstile, #challenge-stage, .main-content div'
+          )
+        );
+        for (const el of candidates) {
+          const rect = el.getBoundingClientRect();
+          if (rect.width >= 250 && rect.width <= 420 && rect.height >= 50 && rect.height <= 95) {
+            return { x: rect.left + 30, y: rect.top + rect.height / 2 };
+          }
+        }
+        return null;
+      });
+
+      if (clickTarget) {
+        const jitterX = clickTarget.x + (Math.random() * 6 - 3);
+        const jitterY = clickTarget.y + (Math.random() * 6 - 3);
+        await page.mouse.move(jitterX, jitterY, { steps: 12 });
+        await page.waitForTimeout(150);
+        await page.mouse.click(jitterX, jitterY);
+      } else {
+        // Delikatny ruch myszą na stronie, aby aktywować weryfikację Turnstile
+        await page.mouse.move(220 + Math.random() * 100, 280 + Math.random() * 60, { steps: 8 });
+      }
+    } catch (_) {}
+
+    await page.waitForTimeout(2500);
   }
+
+  return false;
+}
+
+/**
+ * Pobiera kod HTML strony produktu.
+ * Najpierw próbuje szybkiego zapytania fetch, a jeśli Cloudflare zablokuje ruch,
+ * automatycznie uruchamia przeglądarkę (z zachowaniem sesji i obsługą Turnstile).
+ */
+async function fetchProductHtml(url) {
+  if (!forceBrowserMode) {
+    const headers = {
+      'User-Agent':
+        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',
+      Accept:
+        'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+      'Accept-Language': 'en-GB,en;q=0.9,pl-PL;q=0.8,pl;q=0.7',
+      'Cache-Control': 'no-cache',
+      Pragma: 'no-cache',
+      'Sec-Ch-Ua': '"Chromium";v="134", "Not:A-Brand";v="24", "Google Chrome";v="134"',
+      'Sec-Ch-Ua-Mobile': '?0',
+      'Sec-Ch-Ua-Platform': '"Linux"',
+      'Sec-Fetch-Dest': 'document',
+      'Sec-Fetch-Mode': 'navigate',
+      'Sec-Fetch-Site': 'none',
+      'Sec-Fetch-User': '?1',
+      'Upgrade-Insecure-Requests': '1'
+    };
+
+    try {
+      const response = await fetch(url, { headers, redirect: 'follow' });
+      const html = await response.text();
+      const check = parseProductHtml(html, url);
+
+      if (response.ok && !check.blockedByCloudflare && check.statusType !== 'UNKNOWN_PAGE_STRUCTURE') {
+        return html;
+      }
+      console.log(
+        `[INFO] Zwykłe zapytanie HTTP zwróciło status ${response.status} (${check.statusType}). Przełączam na przeglądarkę...`
+      );
+      forceBrowserMode = true;
+    } catch (err) {
+      console.log(`[INFO] Błąd zwykłego zapytania HTTP. Przełączam na przeglądarkę...`);
+      forceBrowserMode = true;
+    }
+  }
+
+  const context = await getBrowserContext();
+  const existingPages = context.pages();
+  const page = existingPages.length > 0 ? existingPages[0] : await context.newPage();
+
+  await page.bringToFront().catch(() => {});
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+  await waitAndSolveCloudflare(page, 35000);
+  return await page.content();
 }
 
 /**
@@ -394,43 +511,47 @@ async function main() {
 
   console.log(`Sprawdzam dostępność ${books.length} pozycji...\n`);
 
-  for (let i = 0; i < books.length; i++) {
-    const bookUrl = books[i];
-    const itemLabel = `Pozycja #${i + 1}`;
-    console.log(`-> Sprawdzam: ${itemLabel}`);
+  try {
+    for (let i = 0; i < books.length; i++) {
+      const bookUrl = books[i];
+      const itemLabel = `Pozycja #${i + 1}`;
+      console.log(`-> Sprawdzam: ${itemLabel}`);
 
-    const html = await fetchProductHtml(bookUrl);
-    const info = parseProductHtml(html, bookUrl);
+      const html = await fetchProductHtml(bookUrl);
+      const info = parseProductHtml(html, bookUrl);
 
-    console.log(`   Status:   ${info.statusType} (dostępna: ${info.available})`);
-    console.log(`   Przycisk: ${info.buyButtonText} | Schema: ${info.schemaAvailability}`);
+      console.log(`   Status:   ${info.statusType} (dostępna: ${info.available})`);
+      console.log(`   Przycisk: ${info.buyButtonText} | Schema: ${info.schemaAvailability}`);
 
-    if (info.blockedByCloudflare || info.statusType === 'UNKNOWN_PAGE_STRUCTURE') {
-      console.warn(`   ⚠️ Uwaga: Nie udało się jednoznacznie odczytać strony (${info.statusType}).`);
-      continue;
-    }
-
-    const wasAvailableBefore = prevState[bookUrl]?.available === true;
-    nextState[bookUrl] = {
-      available: info.available,
-      statusType: info.statusType,
-      checkedAt: new Date().toISOString()
-    };
-
-    const shouldNotify =
-      forceTestNotification ||
-      (info.available && (alwaysNotifyWhenAvailable || !wasAvailableBefore));
-
-    if (shouldNotify) {
-      if (!webhookUrl) {
-        console.log('   ℹ️ Pozycja dostępna (lub wymuszono test), ale brak zmiennej DISCORD_WEBHOOK_URL.');
-      } else {
-        await sendDiscordNotification(webhookUrl, info, forceTestNotification && !info.available);
-        console.log('   ✅ Wysłano powiadomienie na Discord!');
+      if (info.blockedByCloudflare || info.statusType === 'UNKNOWN_PAGE_STRUCTURE') {
+        console.warn(`   ⚠️ Uwaga: Nie udało się jednoznacznie odczytać strony (${info.statusType}).`);
+        continue;
       }
-    } else {
-      console.log('   ℹ️ Pozycja niedostępna – brak powiadomienia.');
+
+      const wasAvailableBefore = prevState[bookUrl]?.available === true;
+      nextState[bookUrl] = {
+        available: info.available,
+        statusType: info.statusType,
+        checkedAt: new Date().toISOString()
+      };
+
+      const shouldNotify =
+        forceTestNotification ||
+        (info.available && (alwaysNotifyWhenAvailable || !wasAvailableBefore));
+
+      if (shouldNotify) {
+        if (!webhookUrl) {
+          console.log('   ℹ️ Pozycja dostępna (lub wymuszono test), ale brak zmiennej DISCORD_WEBHOOK_URL.');
+        } else {
+          await sendDiscordNotification(webhookUrl, info, forceTestNotification && !info.available);
+          console.log('   ✅ Wysłano powiadomienie na Discord!');
+        }
+      } else {
+        console.log('   ℹ️ Pozycja niedostępna – brak powiadomienia.');
+      }
     }
+  } finally {
+    await closeBrowserContext();
   }
 
   saveState(nextState);
