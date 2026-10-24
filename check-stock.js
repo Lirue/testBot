@@ -250,36 +250,62 @@ async function closeBrowserContext() {
 }
 
 /**
+ * Sprawdza, czy docelowa zawartość strony produktu załadowała się już po weryfikacji Cloudflare.
+ */
+async function isProductPageReady(page) {
+  const hasProductContent = await page
+    .locator('#scope_book_title, .book-actions')
+    .first()
+    .isVisible()
+    .catch(() => false);
+
+  if (hasProductContent) {
+    return true;
+  }
+
+  const title = await page.title().catch(() => '');
+  const content = await page.content().catch(() => '');
+  const isCf =
+    title.includes('Just a moment') ||
+    content.includes('cf-browser-verification') ||
+    content.includes('challenge-platform');
+
+  return !isCf && (content.includes('scope_book_title') || content.includes('book-actions'));
+}
+
+/**
+ * Czeka przez zadany czas (w ms), sprawdzając co 500 ms, czy strona produktu zdążyła się załadować.
+ */
+async function waitForPageReadyOrTimeout(page, waitMs) {
+  const deadline = Date.now() + waitMs;
+  while (Date.now() < deadline) {
+    if (await isProductPageReady(page)) {
+      return true;
+    }
+    await page.waitForTimeout(500);
+  }
+  return await isProductPageReady(page);
+}
+
+/**
  * Próbuje rozwiązać (kliknąć) widget Cloudflare Turnstile ("Verify you are human"),
  * jeśli strona wyświetla ekran "Just a moment...".
  */
 async function waitAndSolveCloudflare(page, maxWaitMs = 35000) {
   const start = Date.now();
 
+  // Dajmy stronie chwilę (do 3.5s) na samoistne przejście Cloudflare lub pełne wyrenderowanie Turnstile
+  if (await waitForPageReadyOrTimeout(page, 3500)) {
+    return true;
+  }
+
   while (Date.now() - start < maxWaitMs) {
-    // Sprawdź, czy docelowa zawartość strony jest już widoczna
-    const hasProductContent = await page
-      .locator('#scope_book_title, .book-actions')
-      .first()
-      .isVisible()
-      .catch(() => false);
-
-    if (hasProductContent) {
-      return true;
-    }
-
-    const title = await page.title().catch(() => '');
-    const content = await page.content().catch(() => '');
-    const isCf =
-      title.includes('Just a moment') ||
-      content.includes('cf-browser-verification') ||
-      content.includes('challenge-platform');
-
-    if (!isCf && content.includes('scope_book_title')) {
+    if (await isProductPageReady(page)) {
       return true;
     }
 
     // Szukamy współrzędnych widgetu Cloudflare Turnstile, aby kliknąć pole wyboru
+    let clicked = false;
     try {
       const clickTarget = await page.evaluate(() => {
         // 1. Sprawdź widoczne iframe Cloudflare
@@ -312,22 +338,27 @@ async function waitAndSolveCloudflare(page, maxWaitMs = 35000) {
         await page.mouse.move(jitterX, jitterY, { steps: 12 });
         await page.waitForTimeout(150);
         await page.mouse.click(jitterX, jitterY);
+        clicked = true;
       } else {
         // Delikatny ruch myszą na stronie, aby aktywować weryfikację Turnstile
         await page.mouse.move(220 + Math.random() * 100, 280 + Math.random() * 60, { steps: 8 });
       }
     } catch (_) {}
 
-    await page.waitForTimeout(2500);
+    // Po kliknięciu czekamy dłużej (do 7 sekund), nie klikając ponownie w trakcie mielenia weryfikacji!
+    const waitAfterAction = clicked ? 7000 : 2500;
+    if (await waitForPageReadyOrTimeout(page, waitAfterAction)) {
+      return true;
+    }
   }
 
-  return false;
+  return await isProductPageReady(page);
 }
 
 /**
  * Pobiera kod HTML strony produktu.
  * Najpierw próbuje szybkiego zapytania fetch, a jeśli Cloudflare zablokuje ruch,
- * automatycznie uruchamia przeglądarkę (z zachowaniem sesji i obsługą Turnstile).
+ * automatycznie uruchamia przeglądarkę (z zachowaniem sesji, obsługą Turnstile i ponawianiem prób).
  */
 async function fetchProductHtml(url) {
   if (!forceBrowserMode) {
@@ -371,10 +402,38 @@ async function fetchProductHtml(url) {
   const existingPages = context.pages();
   const page = existingPages.length > 0 ? existingPages[0] : await context.newPage();
 
-  await page.bringToFront().catch(() => {});
-  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
-  await waitAndSolveCloudflare(page, 35000);
-  return await page.content();
+  const maxAttempts = 3;
+  let lastHtml = '';
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await page.bringToFront().catch(() => {});
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+      await waitAndSolveCloudflare(page, 30000);
+      lastHtml = await page.content();
+
+      const check = parseProductHtml(lastHtml, url);
+      if (!check.blockedByCloudflare && check.statusType !== 'UNKNOWN_PAGE_STRUCTURE') {
+        return lastHtml;
+      }
+
+      if (attempt < maxAttempts) {
+        console.log(
+          `   [INFO] Strona nadal w trakcie weryfikacji Cloudflare – ponawiam odczyt (próba ${attempt + 1}/${maxAttempts})...`
+        );
+        await page.waitForTimeout(2000);
+      }
+    } catch (err) {
+      if (attempt < maxAttempts) {
+        console.log(
+          `   [INFO] Problem podczas ładowania strony – ponawiam (próba ${attempt + 1}/${maxAttempts})...`
+        );
+        await page.waitForTimeout(2000);
+      }
+    }
+  }
+
+  return lastHtml;
 }
 
 /**
