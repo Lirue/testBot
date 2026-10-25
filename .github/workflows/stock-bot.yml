@@ -1,9 +1,9 @@
 name: Book Stock Bot
 
 on:
-  # Uruchamianie automatyczne co 30 minut
+  # Uruchamianie automatyczne
   schedule:
-    - cron: '*/30 * * * *'
+    - cron: '3,33 * * * *'  
 
   # Możliwość ręcznego uruchomienia z zakładki "Actions" na GitHubie
   workflow_dispatch:
